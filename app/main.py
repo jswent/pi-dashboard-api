@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.dependencies import cleanup_services, check_browser_health, check_cec_health
-from exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
+from app.exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
 from app.routers import hdmi, browser
 
 setup_logging(settings.LOG_LEVEL)

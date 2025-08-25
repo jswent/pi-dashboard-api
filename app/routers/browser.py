@@ -111,7 +111,7 @@ async def navigate_to_url(
 async def reload_page(
     page: str, 
     body: ReloadRequest, 
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Reload a specific page"""
     try:
@@ -128,7 +128,7 @@ async def reload_page(
 @router.post("/refresh", response_model=NavigateResult)
 async def refresh_current_page(
     body: ReloadRequest, 
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Refresh the current active page"""
     try:
@@ -143,7 +143,7 @@ async def refresh_current_page(
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.post("/{page}/activate", response_model=Tab)
-async def activate_page(page: str, browser: BrowserManager = Depends(get_browser)):
+async def activate_page(page: str, browser: BrowserDep):
     """Activate/bring a page to front"""
     try:
         return await browser.activate(page)
@@ -152,7 +152,7 @@ async def activate_page(page: str, browser: BrowserManager = Depends(get_browser
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.delete("/{page}")
-async def close_page(page: str, browser: BrowserManager = Depends(get_browser)):
+async def close_page(page: str, browser: BrowserDep):
     """Close a specific page"""
     try:
         await browser.close(page)
@@ -167,7 +167,7 @@ async def close_page(page: str, browser: BrowserManager = Depends(get_browser)):
 async def evaluate_javascript(
     page: str,
     request: EvaluateRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Execute JavaScript code in the page context"""
     try:
@@ -191,7 +191,7 @@ async def evaluate_javascript(
 async def wait_for_element(
     page: str,
     request: SelectorRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Wait for an element to appear on the page"""
     try:
@@ -214,7 +214,7 @@ async def wait_for_element(
 async def click_element(
     page: str,
     request: ClickRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Click on an element"""
     try:
@@ -232,7 +232,7 @@ async def click_element(
 async def type_text_in_element(
     page: str,
     request: TypeRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Type text into an element"""
     try:
@@ -250,7 +250,7 @@ async def type_text_in_element(
 async def get_element_text(
     page: str,
     request: ElementTextRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Get text content of an element"""
     try:
@@ -269,10 +269,10 @@ async def get_element_text(
 @router.get("/{page}/screenshot", response_model=ScreenshotResult)
 async def take_screenshot_json(
     page: str,
+    browser: BrowserDep,
     full_page: bool = Query(default=False),
     format: ScreenshotFormat = Query(default=ScreenshotFormat.png),
-    quality: Optional[int] = Query(default=90, ge=1, le=100),
-    browser: BrowserManager = Depends(get_browser)
+    quality: Optional[int] = Query(default=90, ge=1, le=100)
 ):
     """Take a screenshot and return as base64 JSON response"""
     try:
@@ -298,10 +298,10 @@ async def take_screenshot_json(
 @router.get("/{page}/screenshot/download")
 async def take_screenshot_download(
     page: str,
+    browser: BrowserDep,
     full_page: bool = Query(default=False),
     format: ScreenshotFormat = Query(default=ScreenshotFormat.png),
-    quality: Optional[int] = Query(default=90, ge=1, le=100),
-    browser: BrowserManager = Depends(get_browser)
+    quality: Optional[int] = Query(default=90, ge=1, le=100)
 ):
     """Take a screenshot and return as downloadable file"""
     try:
@@ -328,7 +328,7 @@ async def take_screenshot_download(
 # ==================== COOKIES ====================
 
 @router.get("/{page}/cookies", response_model=CookiesResult)
-async def get_page_cookies(page: str, browser: BrowserManager = Depends(get_browser)):
+async def get_page_cookies(page: str, browser: BrowserDep):
     """Get all cookies for a page"""
     try:
         result = await browser.get_cookies(page)
@@ -348,7 +348,7 @@ async def get_page_cookies(page: str, browser: BrowserManager = Depends(get_brow
 async def set_page_cookies(
     page: str,
     request: CookiesRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Set cookies for a page"""
     try:
@@ -366,7 +366,7 @@ async def set_page_cookies(
         return OperationResult(ok=False, error=str(e))
 
 @router.delete("/{page}/cookies", response_model=OperationResult)
-async def clear_page_cookies(page: str, browser: BrowserManager = Depends(get_browser)):
+async def clear_page_cookies(page: str, browser: BrowserDep):
     """Clear all cookies for a page"""
     try:
         # Get current cookies count first
@@ -392,7 +392,7 @@ async def clear_page_cookies(page: str, browser: BrowserManager = Depends(get_br
 async def set_page_viewport(
     page: str,
     request: ViewportRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Set viewport dimensions and scale for a page"""
     try:
@@ -412,7 +412,7 @@ async def set_page_viewport(
 async def set_color_scheme(
     page: str,
     request: ColorSchemeRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Set color scheme preference for a page"""
     try:
@@ -431,7 +431,7 @@ async def set_color_scheme(
 # ==================== UTILITY ENDPOINTS ====================
 
 @router.get("/{page}/info", response_model=PageInfo)
-async def get_page_info(page: str, browser: BrowserManager = Depends(get_browser)):
+async def get_page_info(page: str, browser: BrowserDep):
     """Get comprehensive information about a page"""
     try:
         tabs = await browser.list_tabs()
@@ -457,7 +457,7 @@ async def get_page_info(page: str, browser: BrowserManager = Depends(get_browser
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.post("/health-check", response_model=OperationResult)
-async def browser_health_check(browser: BrowserManager = Depends(get_browser)):
+async def browser_health_check(browser: BrowserDep):
     """Perform a comprehensive health check of the browser connection"""
     try:
         # Test basic connection
