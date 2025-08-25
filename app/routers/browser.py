@@ -12,17 +12,29 @@ from app.models.browser import (
     CookiesRequest, CookiesResult, SelectorRequest, SelectorResult,
     ClickRequest, TypeRequest, ElementTextRequest, ElementTextResult,
     ColorSchemeRequest, OperationResult, CreatePageRequest, PageInfo,
-    ColorScheme, ScreenshotFormat, SelectorState
+    ColorScheme, ScreenshotFormat, SelectorState, BatchRequest, BatchResult, BatchOperation
 )
 from app.exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
 from app.services.playwright_browser_manager import BrowserManager
-from app.dependencies import get_browser_manager, managed_browser_operation
+from app.dependencies import get_browser_manager, get_pooled_browser, managed_browser_operation
 
 router = APIRouter(tags=["browser"])
 log = logging.getLogger("app.router.browser")
 
-# Type alias for browser dependency
-BrowserDep = Annotated[BrowserManager, Depends(get_browser_manager)]
+# Enhanced dependency that uses connection pooling
+async def get_pooled_browser_dependency():
+    """Dependency wrapper for pooled browser access"""
+    try:
+        async with get_pooled_browser() as browser:
+            yield browser
+    except Exception as e:
+        # Fallback to singleton if pool fails
+        log.warning(f"Pool failed, using fallback singleton: {e}")
+        browser = await get_browser_manager()
+        yield browser
+
+# Type alias for browser dependency - now uses connection pool
+BrowserDep = Annotated[BrowserManager, Depends(get_pooled_browser_dependency)]
 
 # Custom exception handler
 class BrowserOperationError(Exception):

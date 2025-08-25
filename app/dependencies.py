@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import HTTPException, status, Request
 from app.services.playwright_browser_manager import BrowserManager
 from app.services.browser_pool import get_browser_pool, cleanup_browser_pool
+from app.services.chrome_state_manager import cleanup_chrome_state_manager
 from app.services.cec_manager import CecManager
 from app.core.config import settings
 
@@ -122,7 +123,11 @@ async def cleanup_services():
     
     cleanup_tasks = []
     
-    # Cleanup connection pool first
+    # Cleanup ChromeStateManager first
+    log.info("Shutting down Chrome state manager")
+    cleanup_tasks.append(cleanup_chrome_state_manager())
+    
+    # Cleanup connection pool
     log.info("Shutting down browser connection pool")
     cleanup_tasks.append(cleanup_browser_pool())
     
@@ -157,7 +162,18 @@ async def _shutdown_cec_manager(cec_manager: CecManager):
 async def check_browser_health() -> Dict[str, Any]:
     """Check browser service health including connection pool stats"""
     try:
-        # Try to get pool stats
+        # Get ChromeStateManager stats
+        chrome_stats = {}
+        try:
+            from app.services.chrome_state_manager import get_chrome_state_manager
+            chrome_manager = await get_chrome_state_manager()
+            chrome_stats = await chrome_manager.get_stats()
+            chrome_stats["healthy"] = await chrome_manager.is_healthy()
+        except Exception as e:
+            chrome_stats = {"error": str(e), "healthy": False}
+        
+        # Get pool stats
+        pool_stats = {}
         try:
             pool = await get_browser_pool()
             pool_stats = pool.get_stats()
@@ -175,7 +191,8 @@ async def check_browser_health() -> Dict[str, Any]:
                     "browser": status_info.browser,
                     "tabs_count": len(tabs),
                     "connected": browser.browser.is_connected() if browser.browser else False,
-                    "pool_stats": pool_stats
+                    "pool_stats": pool_stats,
+                    "chrome_state_manager": chrome_stats
                 }
         except Exception:
             # Fallback to singleton manager
@@ -189,6 +206,7 @@ async def check_browser_health() -> Dict[str, Any]:
                 "tabs_count": len(tabs),
                 "connected": browser.browser.is_connected() if browser.browser else False,
                 "pool_stats": pool_stats,
+                "chrome_state_manager": chrome_stats,
                 "note": "Using fallback singleton manager"
             }
         
@@ -199,7 +217,8 @@ async def check_browser_health() -> Dict[str, Any]:
             "browser": None,
             "tabs_count": 0,
             "connected": False,
-            "pool_stats": {}
+            "pool_stats": {},
+            "chrome_state_manager": {}
         }
 
 

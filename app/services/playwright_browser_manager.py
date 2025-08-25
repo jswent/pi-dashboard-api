@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 from app.models.browser import Tab, NavigateRequest, NavigateResult, WaitMode, ReloadRequest, BrowserStatus
+from app.services.chrome_state_manager import get_chrome_state_manager, TabState, LoadingState
 from app.core.config import settings
 
 log = logging.getLogger("app.browser")
@@ -301,7 +302,45 @@ class BrowserManager:
                     "User-Agent": self._browser_info.get("User-Agent", "")}
                     
     async def list_tabs(self) -> List[Tab]:
-        """List all open tabs/pages with caching for performance"""
+        """
+        List all open tabs with high-performance ChromeStateManager integration.
+        Uses event-driven state management for optimal performance.
+        """
+        try:
+            # First try to get from ChromeStateManager (high-performance path)
+            try:
+                chrome_state_manager = await get_chrome_state_manager()
+                if await chrome_state_manager.is_healthy():
+                    chrome_tabs = await chrome_state_manager.get_tabs()
+                    
+                    # Convert ChromeStateManager TabState to our Tab model
+                    tabs = []
+                    for i, chrome_tab in enumerate(chrome_tabs):
+                        tab = Tab(
+                            index=i,
+                            id=chrome_tab.target_id,
+                            type="page",
+                            title=chrome_tab.title,
+                            url=chrome_tab.url,
+                            attached=chrome_tab.attached
+                        )
+                        tabs.append(tab)
+                    
+                    log.debug(f"Retrieved {len(tabs)} tabs from ChromeStateManager (high-performance path)")
+                    return tabs
+                    
+            except Exception as e:
+                log.debug(f"ChromeStateManager not available, falling back to Playwright: {e}")
+        
+            # Fallback to Playwright method (slower but reliable)
+            return await self._list_tabs_playwright()
+            
+        except Exception as e:
+            log.error("Failed to list tabs: %s", e)
+            return []
+    
+    async def _list_tabs_playwright(self) -> List[Tab]:
+        """Fallback method using direct Playwright access"""
         if not self.browser or not self.browser.is_connected():
             return []
             
@@ -310,12 +349,10 @@ class BrowserManager:
             now = time.time()
             if (self._tabs_cache is not None and 
                 now - self._tabs_cache_ts < self._tabs_cache_ttl):
-                return self._tabs_cache.copy()  # Return copy to prevent mutation
+                return self._tabs_cache.copy()
             
         try:
             tabs = []
-            
-            # Lazy load contexts to avoid startup hangs
             contexts = []
             try:
                 contexts = self.browser.contexts
@@ -325,10 +362,8 @@ class BrowserManager:
             
             for context in contexts:
                 for i, page in enumerate(context.pages):
-                    # Generate a unique target ID for playwright pages
                     target_id = f"page_{id(page)}"
                     
-                    # Get page title safely - this is expensive, so we cache it
                     try:
                         title = await page.title() if not page.is_closed() else "Closed Page"
                     except Exception:
@@ -349,9 +384,11 @@ class BrowserManager:
                 self._tabs_cache = tabs.copy()
                 self._tabs_cache_ts = time.time()
                     
+            log.debug(f"Retrieved {len(tabs)} tabs from Playwright (fallback path)")
             return tabs
+            
         except Exception as e:
-            log.error("Failed to list tabs: %s", e)
+            log.error("Fallback tab listing failed: %s", e)
             return []
             
     async def _resolve_page(self, page: Optional[str]) -> Tuple[Page, str]:
@@ -469,14 +506,48 @@ class BrowserManager:
             
     # ---------- Public API ----------
     async def status(self) -> BrowserStatus:
-        """Get current browser status"""
-        v = await self.version()
-        tabs = await self.list_tabs()
-        return BrowserStatus(
-            browser=v.get("Browser", "Chromium"), 
-            user_agent=v.get("User-Agent", ""), 
-            tabs=tabs
-        )
+        """
+        Get current browser status with optimal performance.
+        Uses ChromeStateManager for fast tab access when available.
+        """
+        try:
+            # Try high-performance path with ChromeStateManager
+            try:
+                chrome_state_manager = await get_chrome_state_manager()
+                if await chrome_state_manager.is_healthy():
+                    # Get browser info (cached)
+                    v = await self.version()
+                    
+                    # Get tabs from ChromeStateManager (very fast - reader lock only)
+                    tabs = await self.list_tabs()
+                    
+                    log.debug("Browser status retrieved via ChromeStateManager (high-performance)")
+                    return BrowserStatus(
+                        browser=v.get("Browser", "Chromium"), 
+                        user_agent=v.get("User-Agent", ""), 
+                        tabs=tabs
+                    )
+            except Exception as e:
+                log.debug(f"ChromeStateManager not available for status, using fallback: {e}")
+            
+            # Fallback to standard method
+            log.debug("Browser status retrieved via Playwright (fallback)")
+            v = await self.version()
+            tabs = await self.list_tabs()
+            return BrowserStatus(
+                browser=v.get("Browser", "Chromium"), 
+                user_agent=v.get("User-Agent", ""), 
+                tabs=tabs
+            )
+            
+        except Exception as e:
+            log.error(f"Failed to get browser status: {e}")
+            # Return minimal status to prevent total failure
+            return BrowserStatus(
+                browser="Unknown", 
+                user_agent="", 
+                tabs=[]
+            )
         
     async def goto(self, body: NavigateRequest) -> NavigateResult:
         """Navigate to URL with specified options"""
