@@ -15,26 +15,14 @@ from app.models.browser import (
     ColorScheme, ScreenshotFormat, SelectorState, BatchRequest, BatchResult, BatchOperation
 )
 from app.exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
-from app.services.playwright_browser_manager import BrowserManager
-from app.dependencies import get_browser_manager, get_pooled_browser, managed_browser_operation
+from app.services.browser_orchestrator import BrowserOrchestrator
+from app.dependencies import get_browser_orchestrator_dependency
 
 router = APIRouter(tags=["browser"])
 log = logging.getLogger("app.router.browser")
 
-# Enhanced dependency that uses connection pooling
-async def get_pooled_browser_dependency():
-    """Dependency wrapper for pooled browser access"""
-    try:
-        async with get_pooled_browser() as browser:
-            yield browser
-    except Exception as e:
-        # Fallback to singleton if pool fails
-        log.warning(f"Pool failed, using fallback singleton: {e}")
-        browser = await get_browser_manager()
-        yield browser
-
-# Type alias for browser dependency - now uses connection pool
-BrowserDep = Annotated[BrowserManager, Depends(get_pooled_browser_dependency)]
+# Type alias for browser dependency - now uses orchestrator
+BrowserDep = Annotated[BrowserOrchestrator, Depends(get_browser_orchestrator_dependency)]
 
 # Custom exception handler
 class BrowserOperationError(Exception):
@@ -46,16 +34,14 @@ class BrowserOperationError(Exception):
 # ==================== BROWSER STATUS & MANAGEMENT ====================
 
 @router.get("/status", response_model=BrowserStatus)
-async def get_browser_status(browser: BrowserDep):
+async def get_browser_status(orchestrator: BrowserDep):
     """Get current browser status including version and open tabs"""
-    async with managed_browser_operation(browser, "get_status"):
-        return await browser.status()
+    return await orchestrator.get_status()
 
 @router.get("/tabs", response_model=List[Tab])
-async def list_tabs(browser: BrowserDep):
+async def list_tabs(orchestrator: BrowserDep):
     """List all open browser tabs"""
-    async with managed_browser_operation(browser, "list_tabs"):
-        return await browser.list_tabs()
+    return await orchestrator.list_tabs()
 
 @router.post("/tabs", response_model=PageInfo)
 async def create_tab(
@@ -110,24 +96,23 @@ async def create_tab(
 @router.post("/goto", response_model=NavigateResult)
 async def navigate_to_url(
     body: NavigateRequest, 
-    browser: BrowserDep
+    orchestrator: BrowserDep
 ):
     """Navigate to a URL in specified or current tab"""
-    async with managed_browser_operation(browser, "navigate"):
-        result = await browser.goto(body)
-        if not result.ok:
-            raise HTTPException(status_code=502, detail=result.error_text or "Navigation failed")
-        return result
+    result = await orchestrator.navigate(body)
+    if not result.ok:
+        raise HTTPException(status_code=502, detail=result.error_text or "Navigation failed")
+    return result
 
 @router.post("/{page}/reload", response_model=NavigateResult)
 async def reload_page(
     page: str, 
     body: ReloadRequest, 
-    browser: BrowserDep
+    orchestrator: BrowserDep
 ):
     """Reload a specific page"""
     try:
-        result = await browser.reload(page, body)
+        result = await orchestrator.reload_page(page, body)
         if not result.ok:
             raise HTTPException(status_code=502, detail=result.error_text or "Reload failed")
         return result
@@ -140,11 +125,17 @@ async def reload_page(
 @router.post("/refresh", response_model=NavigateResult)
 async def refresh_current_page(
     body: ReloadRequest, 
-    browser: BrowserDep
+    orchestrator: BrowserDep
 ):
     """Refresh the current active page"""
     try:
-        result = await browser.reload(None, body)
+        # For refresh without specific page, we need to get the first available tab
+        tabs = await orchestrator.list_tabs()
+        if not tabs:
+            raise HTTPException(status_code=404, detail="No tabs available to refresh")
+        
+        first_tab_id = tabs[0].id
+        result = await orchestrator.reload_page(first_tab_id, body)
         if not result.ok:
             raise HTTPException(status_code=502, detail=result.error_text or "Refresh failed")
         return result
@@ -155,20 +146,20 @@ async def refresh_current_page(
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.post("/{page}/activate", response_model=Tab)
-async def activate_page(page: str, browser: BrowserDep):
+async def activate_page(page: str, orchestrator: BrowserDep):
     """Activate/bring a page to front"""
     try:
-        return await browser.activate(page)
+        return await orchestrator.activate_page(page)
     except Exception as e:
         log.error("Page activation failed: %s", e)
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.delete("/{page}")
-async def close_page(page: str, browser: BrowserDep):
+async def close_page(page: str, orchestrator: BrowserDep):
     """Close a specific page"""
     try:
-        await browser.close(page)
-        return OperationResult(ok=True, message=f"Page {page} closed successfully")
+        result = await orchestrator.close_page(page)
+        return OperationResult(ok=result["ok"], message=result.get("message", f"Page {page} closed successfully"))
     except Exception as e:
         log.error("Page close failed: %s", e)
         raise HTTPException(status_code=502, detail=str(e))
@@ -179,12 +170,12 @@ async def close_page(page: str, browser: BrowserDep):
 async def evaluate_javascript(
     page: str,
     request: EvaluateRequest,
-    browser: BrowserDep
+    orchestrator: BrowserDep
 ):
     """Execute JavaScript code in the page context"""
     try:
         start_time = time.time()
-        result = await browser.evaluate(page, request.script)
+        result = await orchestrator.evaluate_javascript(page, request.script)
         execution_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         
         return EvaluateResult(
@@ -281,14 +272,14 @@ async def get_element_text(
 @router.get("/{page}/screenshot", response_model=ScreenshotResult)
 async def take_screenshot_json(
     page: str,
-    browser: BrowserDep,
+    orchestrator: BrowserDep,
     full_page: bool = Query(default=False),
     format: ScreenshotFormat = Query(default=ScreenshotFormat.png),
     quality: Optional[int] = Query(default=90, ge=1, le=100)
 ):
     """Take a screenshot and return as base64 JSON response"""
     try:
-        result = await browser.screenshot(page, full_page, format.value)
+        result = await orchestrator.take_screenshot(page, full_page, format.value)
         
         if not result["ok"]:
             return ScreenshotResult(ok=False, error=result.get("error"))
@@ -469,18 +460,18 @@ async def get_page_info(page: str, browser: BrowserDep):
         raise HTTPException(status_code=502, detail=str(e))
 
 @router.post("/health-check", response_model=OperationResult)
-async def browser_health_check(browser: BrowserDep):
+async def browser_health_check(orchestrator: BrowserDep):
     """Perform a comprehensive health check of the browser connection"""
     try:
         # Test basic connection
-        status = await browser.status()
-        tabs = await browser.list_tabs()
+        status = await orchestrator.get_status()
+        tabs = await orchestrator.list_tabs()
         
         # Try a simple evaluation if we have tabs
         eval_ok = True
         if tabs:
             first_page = tabs[0].id
-            eval_result = await browser.evaluate(first_page, "1 + 1")
+            eval_result = await orchestrator.evaluate_javascript(first_page, "1 + 1")
             eval_ok = eval_result.get("ok", False)
         
         health_score = 100

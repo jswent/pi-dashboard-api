@@ -1,24 +1,22 @@
 """
 Dependency injection for the FastAPI application.
-Provides proper lifecycle management and request isolation.
+Provides clean separation of concerns with new browser architecture.
 """
 import asyncio
 import logging
-from typing import AsyncGenerator, Optional, Dict, Any
-from contextlib import asynccontextmanager
-from fastapi import HTTPException, status, Request
-from app.services.playwright_browser_manager import BrowserManager
-from app.services.browser_pool import get_browser_pool, cleanup_browser_pool
-from app.services.chrome_state_manager import cleanup_chrome_state_manager
+from typing import Optional, Dict, Any
+from fastapi import HTTPException, status
+from app.services.browser_orchestrator import get_browser_orchestrator, cleanup_browser_orchestrator, BrowserOrchestrator
+from app.services.cdp_monitor import cleanup_cdp_monitor
+from app.services.playwright_client import cleanup_playwright_client
 from app.services.cec_manager import CecManager
 from app.core.config import settings
 
 log = logging.getLogger("app.dependencies")
 
 # Global instances for singleton services
-_browser_manager: Optional[BrowserManager] = None
 _cec_manager: Optional[CecManager] = None
-_browser_lock = asyncio.Lock()
+_cec_lock = asyncio.Lock()
 
 
 class BrowserServiceError(HTTPException):
@@ -33,44 +31,22 @@ class CECServiceError(HTTPException):
         super().__init__(status_code=status_code, detail=detail)
 
 
-async def get_browser_manager() -> BrowserManager:
+async def get_browser_orchestrator_dependency() -> BrowserOrchestrator:
     """
-    Dependency to get a BrowserManager instance with proper lifecycle management.
-    Uses a singleton pattern with proper initialization checking.
-    DEPRECATED: Use get_pooled_browser() for better resource management.
-    """
-    global _browser_manager
-    
-    async with _browser_lock:
-        if _browser_manager is None:
-            log.info("Initializing BrowserManager")
-            _browser_manager = BrowserManager(settings.BROWSER_DEBUG_HOST, settings.BROWSER_DEBUG_PORT)
-            try:
-                await _browser_manager.start()
-            except Exception as e:
-                log.error("Failed to start BrowserManager: %s", e)
-                _browser_manager = None
-                raise BrowserServiceError(f"Browser service initialization failed: {e}")
-                
-        if _browser_manager is None or not _browser_manager.browser or not _browser_manager.browser.is_connected():
-            raise BrowserServiceError("Browser service not available")
-            
-    return _browser_manager
-
-
-@asynccontextmanager
-async def get_pooled_browser() -> AsyncGenerator[BrowserManager, None]:
-    """
-    Dependency to get a BrowserManager from the connection pool.
-    This is the recommended way to get browser instances for better resource management.
+    Dependency to get the BrowserOrchestrator instance.
+    Provides unified browser operations with clean CDP/Playwright separation.
     """
     try:
-        pool = await get_browser_pool()
-        async with pool.get_connection() as browser:
-            yield browser
+        orchestrator = await get_browser_orchestrator()
+        if not await orchestrator.is_healthy():
+            raise BrowserServiceError("Browser service not healthy")
+        return orchestrator
     except Exception as e:
-        log.error(f"Failed to get browser from pool: {e}")
-        raise BrowserServiceError(f"Browser pool error: {e}")
+        log.error(f"Failed to get browser orchestrator: {e}")
+        raise BrowserServiceError(f"Browser service error: {e}")
+
+
+# Browser pooling removed - single orchestrator manages all browser operations
 
 
 async def get_cec_manager() -> CecManager:
@@ -79,62 +55,43 @@ async def get_cec_manager() -> CecManager:
     """
     global _cec_manager
     
-    if _cec_manager is None:
-        log.info("Initializing CecManager")
-        _cec_manager = CecManager(settings.CEC_DEVICE_NAME if hasattr(settings, "CEC_DEVICE_NAME") else "PiDash")
-        _cec_manager.start()
-        
-    if not _cec_manager.is_connected():
-        raise CECServiceError("CEC service not available")
-        
+    async with _cec_lock:
+        if _cec_manager is None:
+            log.info("Initializing CecManager")
+            _cec_manager = CecManager(settings.CEC_DEVICE_NAME if hasattr(settings, "CEC_DEVICE_NAME") else "PiDash")
+            _cec_manager.start()
+            
+        if not _cec_manager.is_connected():
+            raise CECServiceError("CEC service not available")
+            
     return _cec_manager
 
 
-@asynccontextmanager
-async def managed_browser_operation(browser: BrowserManager, operation_name: str) -> AsyncGenerator[BrowserManager, None]:
-    """
-    Context manager for browser operations with proper error handling and logging.
-    Provides operation isolation and performance tracking.
-    """
-    start_time = asyncio.get_event_loop().time()
-    try:
-        log.debug(f"Starting browser operation: {operation_name}")
-        yield browser
-        elapsed = asyncio.get_event_loop().time() - start_time
-        log.debug(f"Browser operation {operation_name} completed in {elapsed:.3f}s")
-    except Exception as e:
-        elapsed = asyncio.get_event_loop().time() - start_time
-        log.error(f"Browser operation {operation_name} failed after {elapsed:.3f}s: {e}")
-        # Convert known Playwright errors to HTTP exceptions
-        if "timeout" in str(e).lower():
-            raise HTTPException(status_code=status.HTTP_408_REQUEST_TIMEOUT, detail=f"{operation_name} timed out")
-        elif "not found" in str(e).lower() or "page" in str(e).lower():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-        else:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"{operation_name} failed: {e}")
-
+# Browser operation context manager is no longer needed - 
+# BrowserOrchestrator handles operation sequencing internally
 
 async def cleanup_services():
     """
     Cleanup function to be called during application shutdown.
-    Ensures proper resource cleanup for all services including connection pool.
+    Ensures proper resource cleanup for all services.
     """
-    global _browser_manager, _cec_manager
+    global _cec_manager
     
     cleanup_tasks = []
     
-    # Cleanup ChromeStateManager first
-    log.info("Shutting down Chrome state manager")
-    cleanup_tasks.append(cleanup_chrome_state_manager())
+    # Cleanup browser orchestrator and its components
+    log.info("Shutting down browser orchestrator")
+    cleanup_tasks.append(cleanup_browser_orchestrator())
     
-    # Cleanup connection pool
-    log.info("Shutting down browser connection pool")
-    cleanup_tasks.append(cleanup_browser_pool())
+    # Cleanup CDP monitor
+    log.info("Shutting down CDP monitor")
+    cleanup_tasks.append(cleanup_cdp_monitor())
     
-    if _browser_manager:
-        log.info("Shutting down BrowserManager")
-        cleanup_tasks.append(_browser_manager.stop())
-        
+    # Cleanup Playwright client
+    log.info("Shutting down Playwright client")
+    cleanup_tasks.append(cleanup_playwright_client())
+    
+    # Cleanup CEC manager
     if _cec_manager:
         log.info("Shutting down CecManager")
         cleanup_tasks.append(asyncio.create_task(_shutdown_cec_manager(_cec_manager)))
@@ -145,7 +102,6 @@ async def cleanup_services():
         except Exception as e:
             log.error(f"Error during service cleanup: {e}")
     
-    _browser_manager = None
     _cec_manager = None
     log.info("Service cleanup completed")
 
@@ -160,54 +116,30 @@ async def _shutdown_cec_manager(cec_manager: CecManager):
 
 # Health check functions
 async def check_browser_health() -> Dict[str, Any]:
-    """Check browser service health including connection pool stats"""
+    """Check browser service health using new orchestrator architecture"""
     try:
-        # Get ChromeStateManager stats
-        chrome_stats = {}
-        try:
-            from app.services.chrome_state_manager import get_chrome_state_manager
-            chrome_manager = await get_chrome_state_manager()
-            chrome_stats = await chrome_manager.get_stats()
-            chrome_stats["healthy"] = await chrome_manager.is_healthy()
-        except Exception as e:
-            chrome_stats = {"error": str(e), "healthy": False}
+        orchestrator = await get_browser_orchestrator()
         
-        # Get pool stats
-        pool_stats = {}
-        try:
-            pool = await get_browser_pool()
-            pool_stats = pool.get_stats()
-        except Exception as e:
-            pool_stats = {"error": str(e)}
+        # Get orchestrator health and stats
+        is_healthy = await orchestrator.is_healthy()
+        stats = await orchestrator.get_stats()
         
-        # Test a connection from the pool
-        try:
-            async with get_pooled_browser() as browser:
-                status_info = await browser.status()
-                tabs = await browser.list_tabs()
-                
-                return {
-                    "status": "healthy",
-                    "browser": status_info.browser,
-                    "tabs_count": len(tabs),
-                    "connected": browser.browser.is_connected() if browser.browser else False,
-                    "pool_stats": pool_stats,
-                    "chrome_state_manager": chrome_stats
-                }
-        except Exception:
-            # Fallback to singleton manager
-            browser = await get_browser_manager()
-            status_info = await browser.status()
-            tabs = await browser.list_tabs()
+        if is_healthy:
+            # Get browser status for detailed info
+            status_info = await orchestrator.get_status()
             
             return {
                 "status": "healthy",
                 "browser": status_info.browser,
-                "tabs_count": len(tabs),
-                "connected": browser.browser.is_connected() if browser.browser else False,
-                "pool_stats": pool_stats,
-                "chrome_state_manager": chrome_stats,
-                "note": "Using fallback singleton manager"
+                "user_agent": status_info.user_agent,
+                "tabs_count": len(status_info.tabs),
+                "orchestrator_stats": stats
+            }
+        else:
+            return {
+                "status": "unhealthy",
+                "error": "Browser orchestrator reports unhealthy",
+                "orchestrator_stats": stats
             }
         
     except Exception as e:
@@ -215,10 +147,7 @@ async def check_browser_health() -> Dict[str, Any]:
             "status": "unhealthy", 
             "error": str(e),
             "browser": None,
-            "tabs_count": 0,
-            "connected": False,
-            "pool_stats": {},
-            "chrome_state_manager": {}
+            "tabs_count": 0
         }
 
 
@@ -242,22 +171,5 @@ async def check_cec_health() -> Dict[str, Any]:
         }
 
 
-# Legacy compatibility functions for gradual migration
-def get_browser(req: Request) -> BrowserManager:
-    """
-    DEPRECATED: Legacy dependency function for gradual migration.
-    Use get_browser_manager() directly instead.
-    """
-    log.warning("Using deprecated get_browser dependency. Migrate to get_browser_manager()")
-    if not hasattr(req.app.state, 'browser') or req.app.state.browser is None:
-        raise HTTPException(status_code=503, detail="Browser service not available")
-    return req.app.state.browser
-
-
-def get_cec(req: Request) -> CecManager:
-    """
-    DEPRECATED: Legacy dependency function for gradual migration. 
-    Use get_cec_manager() directly instead.
-    """
-    log.warning("Using deprecated get_cec dependency. Migrate to get_cec_manager()")
-    return req.app.state.cec
+# Legacy compatibility - all browser operations now go through orchestrator
+# No more direct browser manager access needed
