@@ -2,6 +2,7 @@ import logging
 import asyncio
 import time
 from typing import List, Optional, Tuple, Dict, Any
+from contextlib import asynccontextmanager
 from pydantic import HttpUrl
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
@@ -145,6 +146,112 @@ class BrowserManager:
         async with self._tabs_cache_lock:
             self._tabs_cache = None
             self._tabs_cache_ts = 0
+    
+    @asynccontextmanager
+    async def managed_page(self, page_id: Optional[str] = None, create_if_missing: bool = False):
+        """
+        Async context manager for page operations with proper resource management.
+        Ensures proper cleanup and error handling for all page operations.
+        """
+        page_obj = None
+        target_id = None
+        operation_start = time.time()
+        
+        try:
+            # Resolve or create page
+            if create_if_missing:
+                try:
+                    page_obj, target_id = await self._resolve_page(page_id)
+                except ValueError:
+                    # Page not found, create a new one
+                    context = await self._ensure_context()
+                    page_obj = await context.new_page()
+                    target_id = f"page_{id(page_obj)}"
+                    
+                    async with self._state_lock:
+                        self._pages[target_id] = page_obj
+                        self._last_target_id = target_id
+                        await self._invalidate_tabs_cache()
+            else:
+                page_obj, target_id = await self._resolve_page(page_id)
+            
+            # Verify page is still valid
+            if page_obj.is_closed():
+                raise RuntimeError(f"Page {target_id} is closed")
+                
+            log.debug(f"Acquired page {target_id} for operation")
+            yield page_obj, target_id
+            
+        except Exception as e:
+            elapsed = time.time() - operation_start
+            log.error(f"Page operation failed after {elapsed:.3f}s: {e}")
+            raise
+        finally:
+            elapsed = time.time() - operation_start
+            if page_obj and target_id:
+                log.debug(f"Released page {target_id} after {elapsed:.3f}s")
+    
+    @asynccontextmanager
+    async def managed_navigation(self, page_obj: Page, url: str, timeout_ms: int = 30000):
+        """
+        Async context manager for navigation operations with timeout and error handling.
+        """
+        start_time = time.time()
+        try:
+            log.debug(f"Starting navigation to {url}")
+            
+            # Set up navigation promise before triggering navigation
+            response = await page_obj.goto(str(url), wait_until='load', timeout=timeout_ms)
+            
+            elapsed = time.time() - start_time
+            log.debug(f"Navigation to {url} completed in {elapsed:.3f}s")
+            yield response
+            
+        except PlaywrightTimeoutError as e:
+            elapsed = time.time() - start_time
+            log.error(f"Navigation to {url} timed out after {elapsed:.3f}s")
+            raise TimeoutError(f"Navigation timed out after {elapsed:.3f}s")
+        except Exception as e:
+            elapsed = time.time() - start_time
+            log.error(f"Navigation to {url} failed after {elapsed:.3f}s: {e}")
+            raise RuntimeError(f"Navigation failed: {e}")
+    
+    @asynccontextmanager
+    async def managed_element_interaction(self, page_obj: Page, selector: str, operation: str, timeout_ms: int = 30000):
+        """
+        Async context manager for element interactions with proper waiting and error handling.
+        """
+        start_time = time.time()
+        element = None
+        
+        try:
+            log.debug(f"Waiting for element '{selector}' for {operation}")
+            
+            # Wait for element to be available
+            element = await page_obj.wait_for_selector(
+                selector, 
+                timeout=timeout_ms,
+                state='visible'
+            )
+            
+            if element is None:
+                raise RuntimeError(f"Element '{selector}' not found")
+                
+            elapsed = time.time() - start_time
+            log.debug(f"Element '{selector}' found after {elapsed:.3f}s for {operation}")
+            yield element
+            
+        except PlaywrightTimeoutError:
+            elapsed = time.time() - start_time
+            log.error(f"Element '{selector}' not found after {elapsed:.3f}s timeout")
+            raise TimeoutError(f"Element '{selector}' not found after timeout")
+        except Exception as e:
+            elapsed = time.time() - start_time
+            log.error(f"Element interaction '{operation}' on '{selector}' failed after {elapsed:.3f}s: {e}")
+            raise RuntimeError(f"Element interaction failed: {e}")
+        finally:
+            elapsed = time.time() - start_time
+            log.debug(f"Element interaction '{operation}' on '{selector}' completed after {elapsed:.3f}s")
             
     async def version(self) -> dict:
         """Get browser version information"""
@@ -644,31 +751,34 @@ class BrowserManager:
             return {"ok": False, "error": str(e)}
             
     async def click_element(self, page: str, selector: str, timeout: int = 30000) -> Dict[str, Any]:
-        """Click on element"""
+        """Click on element using managed context"""
         try:
-            page_obj, _ = await self._resolve_page(page)
-            await page_obj.click(selector, timeout=timeout)
-            return {"ok": True}
+            async with self.managed_page(page) as (page_obj, target_id):
+                async with self.managed_element_interaction(page_obj, selector, "click", timeout) as element:
+                    await element.click()
+                    return {"ok": True}
         except Exception as e:
             log.error("click_element failed: %s", e)
             return {"ok": False, "error": str(e)}
             
     async def type_text(self, page: str, selector: str, text: str, timeout: int = 30000) -> Dict[str, Any]:
-        """Type text into element"""
+        """Type text into element using managed context"""
         try:
-            page_obj, _ = await self._resolve_page(page)
-            await page_obj.fill(selector, text, timeout=timeout)
-            return {"ok": True}
+            async with self.managed_page(page) as (page_obj, target_id):
+                async with self.managed_element_interaction(page_obj, selector, "type", timeout) as element:
+                    await element.fill(text)
+                    return {"ok": True}
         except Exception as e:
             log.error("type_text failed: %s", e)
             return {"ok": False, "error": str(e)}
             
     async def get_element_text(self, page: str, selector: str, timeout: int = 30000) -> Dict[str, Any]:
-        """Get text content of element"""
+        """Get text content of element using managed context"""
         try:
-            page_obj, _ = await self._resolve_page(page)
-            text = await page_obj.text_content(selector, timeout=timeout)
-            return {"ok": True, "text": text}
+            async with self.managed_page(page) as (page_obj, target_id):
+                async with self.managed_element_interaction(page_obj, selector, "get_text", timeout) as element:
+                    text = await element.text_content()
+                    return {"ok": True, "text": text}
         except Exception as e:
             log.error("get_element_text failed: %s", e)
             return {"ok": False, "error": str(e), "text": None}
