@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Optional, Dict, Any
 from contextlib import asynccontextmanager
 from fastapi import HTTPException, status, Request
 from app.services.playwright_browser_manager import BrowserManager
+from app.services.browser_pool import get_browser_pool, cleanup_browser_pool
 from app.services.cec_manager import CecManager
 from app.core.config import settings
 
@@ -35,6 +36,7 @@ async def get_browser_manager() -> BrowserManager:
     """
     Dependency to get a BrowserManager instance with proper lifecycle management.
     Uses a singleton pattern with proper initialization checking.
+    DEPRECATED: Use get_pooled_browser() for better resource management.
     """
     global _browser_manager
     
@@ -53,6 +55,21 @@ async def get_browser_manager() -> BrowserManager:
             raise BrowserServiceError("Browser service not available")
             
     return _browser_manager
+
+
+@asynccontextmanager
+async def get_pooled_browser() -> AsyncGenerator[BrowserManager, None]:
+    """
+    Dependency to get a BrowserManager from the connection pool.
+    This is the recommended way to get browser instances for better resource management.
+    """
+    try:
+        pool = await get_browser_pool()
+        async with pool.get_connection() as browser:
+            yield browser
+    except Exception as e:
+        log.error(f"Failed to get browser from pool: {e}")
+        raise BrowserServiceError(f"Browser pool error: {e}")
 
 
 async def get_cec_manager() -> CecManager:
@@ -99,11 +116,15 @@ async def managed_browser_operation(browser: BrowserManager, operation_name: str
 async def cleanup_services():
     """
     Cleanup function to be called during application shutdown.
-    Ensures proper resource cleanup for all services.
+    Ensures proper resource cleanup for all services including connection pool.
     """
     global _browser_manager, _cec_manager
     
     cleanup_tasks = []
+    
+    # Cleanup connection pool first
+    log.info("Shutting down browser connection pool")
+    cleanup_tasks.append(cleanup_browser_pool())
     
     if _browser_manager:
         log.info("Shutting down BrowserManager")
@@ -134,25 +155,51 @@ async def _shutdown_cec_manager(cec_manager: CecManager):
 
 # Health check functions
 async def check_browser_health() -> Dict[str, Any]:
-    """Check browser service health"""
+    """Check browser service health including connection pool stats"""
     try:
-        browser = await get_browser_manager()
-        status_info = await browser.status()
-        tabs = await browser.list_tabs()
+        # Try to get pool stats
+        try:
+            pool = await get_browser_pool()
+            pool_stats = pool.get_stats()
+        except Exception as e:
+            pool_stats = {"error": str(e)}
         
-        return {
-            "status": "healthy",
-            "browser": status_info.browser,
-            "tabs_count": len(tabs),
-            "connected": browser.browser.is_connected() if browser.browser else False
-        }
+        # Test a connection from the pool
+        try:
+            async with get_pooled_browser() as browser:
+                status_info = await browser.status()
+                tabs = await browser.list_tabs()
+                
+                return {
+                    "status": "healthy",
+                    "browser": status_info.browser,
+                    "tabs_count": len(tabs),
+                    "connected": browser.browser.is_connected() if browser.browser else False,
+                    "pool_stats": pool_stats
+                }
+        except Exception:
+            # Fallback to singleton manager
+            browser = await get_browser_manager()
+            status_info = await browser.status()
+            tabs = await browser.list_tabs()
+            
+            return {
+                "status": "healthy",
+                "browser": status_info.browser,
+                "tabs_count": len(tabs),
+                "connected": browser.browser.is_connected() if browser.browser else False,
+                "pool_stats": pool_stats,
+                "note": "Using fallback singleton manager"
+            }
+        
     except Exception as e:
         return {
             "status": "unhealthy", 
             "error": str(e),
             "browser": None,
             "tabs_count": 0,
-            "connected": False
+            "connected": False,
+            "pool_stats": {}
         }
 
 
