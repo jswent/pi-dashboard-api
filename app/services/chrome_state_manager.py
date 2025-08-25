@@ -21,10 +21,10 @@ except ImportError:
         def __init__(self):
             self._lock = asyncio.Lock()
         
-        def reader_lock(self):
+        def reader(self):
             return self._lock
         
-        def writer_lock(self):
+        def writer(self):
             return self._lock
 
 from app.core.config import settings
@@ -159,6 +159,7 @@ class ChromeStateManager:
         self._websocket: Optional[websockets.WebSocketServerProtocol] = None
         self._websocket_url: Optional[str] = None
         self._next_request_id = 1
+        self._websocket_lock = asyncio.Lock()  # Serialize WebSocket access
         
         # Performance monitoring
         self._stats = {
@@ -188,10 +189,12 @@ class ChromeStateManager:
             
             # Start background tasks
             self._event_processor_task = asyncio.create_task(self._event_processor_worker())
-            self._websocket_listener_task = asyncio.create_task(self._websocket_listener_worker())
             
-            # Initial state population
+            # Initial state population (before starting WebSocket listener)
             await self._populate_initial_state()
+            
+            # Start WebSocket listener after initial population
+            self._websocket_listener_task = asyncio.create_task(self._websocket_listener_worker())
             
             self._running = True
             log.info("Chrome state manager started successfully")
@@ -234,7 +237,7 @@ class ChromeStateManager:
         Get all tabs with high-performance concurrent read access.
         Uses reader lock to allow multiple concurrent reads.
         """
-        async with self._rw_lock.reader_lock():
+        async with self._rw_lock.reader():
             self._stats["read_requests"] += 1
             return list(self._state.tabs.values())
     
@@ -252,7 +255,7 @@ class ChromeStateManager:
                 return self._hot_cache[target_id]
         
         # Not in hot cache, read from main state
-        async with self._rw_lock.reader_lock():
+        async with self._rw_lock.reader():
             self._stats["read_requests"] += 1
             self._stats["cache_misses"] += 1
             tab_state = self._state.tabs.get(target_id)
@@ -265,13 +268,13 @@ class ChromeStateManager:
     
     async def get_browser_info(self) -> Dict[str, Any]:
         """Get browser information with concurrent read access"""
-        async with self._rw_lock.reader_lock():
+        async with self._rw_lock.reader():
             self._stats["read_requests"] += 1
             return self._state.browser_info.copy()
     
     async def is_healthy(self) -> bool:
         """Check if Chrome connection is healthy"""
-        async with self._rw_lock.reader_lock():
+        async with self._rw_lock.reader():
             return self._state.connection_healthy and self._websocket is not None
     
     async def get_stats(self) -> Dict[str, Any]:
@@ -331,8 +334,9 @@ class ChromeStateManager:
             self._next_request_id += 1
             
             try:
-                await self._websocket.send(json.dumps(request))
-                log.debug(f"Enabled Chrome domain: {domain}")
+                async with self._websocket_lock:
+                    await self._websocket.send(json.dumps(request))
+                    log.debug(f"Enabled Chrome domain: {domain}")
             except Exception as e:
                 log.warning(f"Failed to enable domain {domain}: {e}")
     
@@ -347,11 +351,12 @@ class ChromeStateManager:
             }
             self._next_request_id += 1
             
-            await self._websocket.send(json.dumps(request))
-            
-            # Wait for response (this is initial setup, so blocking is OK)
-            response_raw = await asyncio.wait_for(self._websocket.recv(), timeout=5.0)
-            response = json.loads(response_raw)
+            async with self._websocket_lock:
+                await self._websocket.send(json.dumps(request))
+                
+                # Wait for response (this is initial setup, so blocking is OK)
+                response_raw = await asyncio.wait_for(self._websocket.recv(), timeout=5.0)
+                response = json.loads(response_raw)
             
             if response.get("id") == request["id"] and "result" in response:
                 targets = response["result"].get("targetInfos", [])
@@ -370,7 +375,7 @@ class ChromeStateManager:
                         new_tabs[target["targetId"]] = tab_state
                 
                 # Atomic state update
-                async with self._rw_lock.writer_lock():
+                async with self._rw_lock.writer():
                     self._stats["write_requests"] += 1
                     self._state = self._state.with_tab_update("", TabState("", "", "")).with_active_tab(None)
                     self._state = replace(self._state, tabs=new_tabs, last_update=time.time())
@@ -394,8 +399,9 @@ class ChromeStateManager:
                 
                 # Listen for Chrome events
                 try:
-                    message_raw = await asyncio.wait_for(self._websocket.recv(), timeout=1.0)
-                    message = json.loads(message_raw)
+                    async with self._websocket_lock:
+                        message_raw = await asyncio.wait_for(self._websocket.recv(), timeout=1.0)
+                        message = json.loads(message_raw)
                     
                     # Filter and queue relevant events
                     if "method" in message:
@@ -499,7 +505,7 @@ class ChromeStateManager:
     
     async def _apply_event_batch(self, events: List[ChromeEvent]):
         """Apply a batch of events atomically with write lock"""
-        async with self._rw_lock.writer_lock():
+        async with self._rw_lock.writer():
             self._stats["write_requests"] += 1
             current_state = self._state
             
@@ -589,7 +595,7 @@ class ChromeStateManager:
     
     async def _mark_connection_unhealthy(self):
         """Mark connection as unhealthy atomically"""
-        async with self._rw_lock.writer_lock():
+        async with self._rw_lock.writer():
             self._stats["write_requests"] += 1
             self._state = replace(self._state, connection_healthy=False, last_update=time.time())
     
@@ -610,7 +616,7 @@ class ChromeStateManager:
                 await self._connect_websocket()
                 
                 # Mark connection as healthy
-                async with self._rw_lock.writer_lock():
+                async with self._rw_lock.writer():
                     self._stats["write_requests"] += 1
                     self._stats["websocket_reconnections"] += 1
                     self._state = replace(self._state, connection_healthy=True, last_update=time.time())
