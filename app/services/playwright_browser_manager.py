@@ -33,6 +33,10 @@ class BrowserManager:
         self._tabs_cache_ttl: float = 1.0  # 1 second TTL
         self._tabs_cache_lock = asyncio.Lock()
         
+        # CDP target ID to Playwright Page mapping
+        self._cdp_target_to_page: Dict[str, Page] = {}  # CDP target ID -> Page
+        self._page_to_cdp_target: Dict[Page, str] = {}  # Page -> CDP target ID
+        
     async def start(self):
         """Initialize browser connection using playwright"""
         try:
@@ -391,34 +395,96 @@ class BrowserManager:
             log.error("Fallback tab listing failed: %s", e)
             return []
             
+    async def _get_cdp_target_id(self, page: Page) -> Optional[str]:
+        """Get Chrome DevTools Protocol target ID for a Playwright page"""
+        try:
+            # Get the CDP session from the page
+            cdp_session = await page.context.new_cdp_session(page)
+            target_info = await cdp_session.send('Target.getTargetInfo')
+            await cdp_session.detach()
+            return target_info.get('targetInfo', {}).get('targetId')
+        except Exception as e:
+            log.debug(f"Could not get CDP target ID for page: {e}")
+            return None
+    
+    async def _update_cdp_mappings(self):
+        """Update the mapping between CDP target IDs and Playwright pages"""
+        try:
+            if not self.browser or not self.browser.is_connected():
+                return
+                
+            # Clear old mappings
+            self._cdp_target_to_page.clear()
+            self._page_to_cdp_target.clear()
+            
+            # Map all current pages
+            for context in self.browser.contexts:
+                for page in context.pages:
+                    if not page.is_closed():
+                        cdp_target_id = await self._get_cdp_target_id(page)
+                        if cdp_target_id:
+                            self._cdp_target_to_page[cdp_target_id] = page
+                            self._page_to_cdp_target[page] = cdp_target_id
+                            log.debug(f"Mapped CDP target {cdp_target_id} to Playwright page")
+                            
+        except Exception as e:
+            log.warning(f"Failed to update CDP mappings: {e}")
+    
     async def _resolve_page(self, page: Optional[str]) -> Tuple[Page, str]:
         """Resolve page identifier to Page object and target_id - Thread safe"""
         async with self._state_lock:
+            # Update CDP mappings to ensure they're current
+            await self._update_cdp_mappings()
+            
             tabs = await self.list_tabs()
             
             if not tabs:
                 # Create a new page if none exist
                 context = await self._ensure_context()
                 new_page = await context.new_page()
-                target_id = f"page_{id(new_page)}"
-                self._pages[target_id] = new_page
-                self._last_target_id = target_id
-                await self._invalidate_tabs_cache()
-                return new_page, target_id
+                
+                # Get CDP target ID for the new page
+                cdp_target_id = await self._get_cdp_target_id(new_page)
+                if cdp_target_id:
+                    self._cdp_target_to_page[cdp_target_id] = new_page
+                    self._page_to_cdp_target[new_page] = cdp_target_id
+                    self._last_target_id = cdp_target_id
+                    await self._invalidate_tabs_cache()
+                    return new_page, cdp_target_id
+                else:
+                    # Fallback to old behavior if CDP mapping fails
+                    target_id = f"page_{id(new_page)}"
+                    self._pages[target_id] = new_page
+                    self._last_target_id = target_id
+                    await self._invalidate_tabs_cache()
+                    return new_page, target_id
                 
             if page is None:
                 # Use last active or first page
-                if self._last_target_id and self._last_target_id in self._pages:
-                    page_obj = self._pages[self._last_target_id]
-                    if not page_obj.is_closed():
-                        return page_obj, self._last_target_id
+                if self._last_target_id:
+                    # Try CDP mapping first
+                    if self._last_target_id in self._cdp_target_to_page:
+                        page_obj = self._cdp_target_to_page[self._last_target_id]
+                        if not page_obj.is_closed():
+                            return page_obj, self._last_target_id
+                    # Fallback to old tracking
+                    elif self._last_target_id in self._pages:
+                        page_obj = self._pages[self._last_target_id]
+                        if not page_obj.is_closed():
+                            return page_obj, self._last_target_id
                         
                 # Use first available page
                 if tabs:
                     first_tab = tabs[0]
                     target_id = first_tab.id
                     
-                    # Find the actual page object
+                    # Try CDP mapping first
+                    if target_id in self._cdp_target_to_page:
+                        page_obj = self._cdp_target_to_page[target_id]
+                        if not page_obj.is_closed():
+                            return page_obj, target_id
+                    
+                    # Fallback: Find by old method
                     for context in self.browser.contexts:
                         for pg in context.pages:
                             if f"page_{id(pg)}" == target_id and not pg.is_closed():
@@ -432,7 +498,13 @@ class BrowserManager:
                     target_tab = tabs[idx]
                     target_id = target_tab.id
                     
-                    # Find the actual page object
+                    # Try CDP mapping first
+                    if target_id in self._cdp_target_to_page:
+                        page_obj = self._cdp_target_to_page[target_id]
+                        if not page_obj.is_closed():
+                            return page_obj, target_id
+                    
+                    # Fallback: Find by old method
                     for context in self.browser.contexts:
                         for pg in context.pages:
                             if f"page_{id(pg)}" == target_id and not pg.is_closed():
@@ -441,21 +513,27 @@ class BrowserManager:
             except (ValueError, IndexError):
                 pass
                 
-            # Assume it's a target ID
-            if page in self._pages:
-                page_obj = self._pages[page]
-                if not page_obj.is_closed():
-                    return page_obj, page
-                    
-            # Search by target ID in tabs
-            for tab in tabs:
-                if tab.id == page:
-                    # Find the actual page object
-                    for context in self.browser.contexts:
-                        for pg in context.pages:
-                            if f"page_{id(pg)}" == tab.id and not pg.is_closed():
-                                self._pages[tab.id] = pg
-                                return pg, tab.id
+            # Direct target ID lookup
+            if page:
+                # Try CDP mapping first (this should handle Chrome DevTools target IDs)
+                if page in self._cdp_target_to_page:
+                    page_obj = self._cdp_target_to_page[page]
+                    if not page_obj.is_closed():
+                        return page_obj, page
+                
+                # Try old tracking system
+                if page in self._pages:
+                    page_obj = self._pages[page]
+                    if not page_obj.is_closed():
+                        return page_obj, page
+                        
+                # Search by target ID in tabs (with CDP mapping)
+                for tab in tabs:
+                    if tab.id == page:
+                        if tab.id in self._cdp_target_to_page:
+                            page_obj = self._cdp_target_to_page[tab.id]
+                            if not page_obj.is_closed():
+                                return page_obj, tab.id
                                 
             raise ValueError(f"Page '{page}' not found")
         
