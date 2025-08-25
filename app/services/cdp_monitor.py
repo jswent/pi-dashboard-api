@@ -44,9 +44,19 @@ class LoadingState(Enum):
 
 class EventType(Enum):
     """Chrome debugging event types we care about"""
+    # Target events for tab creation/destruction
     TARGET_CREATED = "Target.targetCreated"
     TARGET_DESTROYED = "Target.targetDestroyed"
     TARGET_INFO_CHANGED = "Target.targetInfoChanged"
+    
+    # Page events for navigation and loading states
+    PAGE_FRAME_STARTED_NAVIGATING = "Page.frameStartedNavigating"
+    PAGE_FRAME_NAVIGATED = "Page.frameNavigated"
+    PAGE_NAVIGATED_WITHIN_DOCUMENT = "Page.navigatedWithinDocument"
+    PAGE_FRAME_STARTED_LOADING = "Page.frameStartedLoading"
+    PAGE_FRAME_STOPPED_LOADING = "Page.frameStoppedLoading"
+    PAGE_DOM_CONTENT_EVENT_FIRED = "Page.domContentEventFired"
+    PAGE_LOAD_EVENT_FIRED = "Page.loadEventFired"
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,7 @@ class TabState:
     loading_state: LoadingState = LoadingState.IDLE
     is_page: bool = True
     attached: bool = True
+    main_frame_id: Optional[str] = None  # Track main frame for Page events
     timestamp: float = field(default_factory=time.time)
     
     def with_update(self, **kwargs) -> 'TabState':
@@ -137,6 +148,9 @@ class CDPMonitor:
         self._websocket_url: Optional[str] = None
         self._next_request_id = 1
         self._websocket_lock = asyncio.Lock()
+        
+        # Frame to target mapping for Page events
+        self._frame_to_target: Dict[str, str] = {}  # frameId -> targetId
         
         # Statistics
         self._stats = {
@@ -262,8 +276,11 @@ class CDPMonitor:
                 close_timeout=5
             )
             
-            # Enable Target domain for tab tracking
+            # Enable Target discovery for tab tracking
             await self._enable_target_domain()
+            
+            # Enable Page domain for navigation events
+            await self._enable_page_domain()
             
             log.info(f"Connected to Chrome WebSocket: {self._websocket_url}")
             
@@ -272,10 +289,26 @@ class CDPMonitor:
             raise
     
     async def _enable_target_domain(self):
-        """Enable Target domain for tab tracking"""
+        """Enable Target discovery for tab tracking"""
         request = {
             "id": self._next_request_id,
-            "method": "Target.enable",
+            "method": "Target.setDiscoverTargets",
+            "params": {"discover": True}
+        }
+        self._next_request_id += 1
+        
+        try:
+            async with self._websocket_lock:
+                await self._websocket.send(json.dumps(request))
+                log.debug("Enabled Target discovery")
+        except Exception as e:
+            log.warning(f"Failed to enable Target discovery: {e}")
+    
+    async def _enable_page_domain(self):
+        """Enable Page domain for navigation and loading events"""
+        request = {
+            "id": self._next_request_id,
+            "method": "Page.enable",
             "params": {}
         }
         self._next_request_id += 1
@@ -283,9 +316,9 @@ class CDPMonitor:
         try:
             async with self._websocket_lock:
                 await self._websocket.send(json.dumps(request))
-                log.debug("Attempted to enable Target domain")
+                log.debug("Enabled Page domain")
         except Exception as e:
-            log.warning(f"Failed to enable Target domain: {e}")
+            log.warning(f"Failed to enable Page domain: {e}")
     
     async def _populate_initial_state(self):
         """Get initial browser state from Chrome"""
@@ -323,7 +356,8 @@ class CDPMonitor:
                                         url=target.get("url", ""),
                                         title=target.get("title", "Unknown"),
                                         loading_state=LoadingState.COMPLETE,
-                                        attached=target.get("attached", False)
+                                        attached=target.get("attached", False),
+                                        main_frame_id=None  # Will be populated by Page events
                                     )
                                     new_tabs[target["targetId"]] = tab_state
                             
@@ -400,9 +434,19 @@ class CDPMonitor:
         
         # Map Chrome events to our events
         event_mapping = {
+            # Target events for tab creation/destruction
             "Target.targetCreated": EventType.TARGET_CREATED,
             "Target.targetDestroyed": EventType.TARGET_DESTROYED, 
             "Target.targetInfoChanged": EventType.TARGET_INFO_CHANGED,
+            
+            # Page events for navigation and loading states
+            "Page.frameStartedNavigating": EventType.PAGE_FRAME_STARTED_NAVIGATING,
+            "Page.frameNavigated": EventType.PAGE_FRAME_NAVIGATED,
+            "Page.navigatedWithinDocument": EventType.PAGE_NAVIGATED_WITHIN_DOCUMENT,
+            "Page.frameStartedLoading": EventType.PAGE_FRAME_STARTED_LOADING,
+            "Page.frameStoppedLoading": EventType.PAGE_FRAME_STOPPED_LOADING,
+            "Page.domContentEventFired": EventType.PAGE_DOM_CONTENT_EVENT_FIRED,
+            "Page.loadEventFired": EventType.PAGE_LOAD_EVENT_FIRED,
         }
         
         if method in event_mapping:
@@ -411,6 +455,10 @@ class CDPMonitor:
             if method.startswith("Target."):
                 target_info = params.get("targetInfo", {})
                 target_id = target_info.get("targetId") or params.get("targetId")
+            elif method.startswith("Page."):
+                # Page events don't have target IDs directly, we'll need to track frames
+                # For now, log these events for processing
+                log.debug(f"Received Page event {method} with params: {params}")
             
             event = CDPEvent(
                 event_type=event_mapping[method],
@@ -430,6 +478,7 @@ class CDPMonitor:
             self._stats["write_requests"] += 1
             current_state = self._state
             
+            # Handle Target events (tab creation/destruction/info changes)
             if event.event_type == EventType.TARGET_CREATED:
                 target_info = event.data.get("targetInfo", {})
                 if target_info.get("type") == "page":
@@ -445,6 +494,10 @@ class CDPMonitor:
             elif event.event_type == EventType.TARGET_DESTROYED:
                 if event.target_id:
                     current_state = current_state.without_tab(event.target_id)
+                    # Clean up frame mappings for this target
+                    frames_to_remove = [frame_id for frame_id, target_id in self._frame_to_target.items() if target_id == event.target_id]
+                    for frame_id in frames_to_remove:
+                        del self._frame_to_target[frame_id]
             
             elif event.event_type == EventType.TARGET_INFO_CHANGED:
                 target_info = event.data.get("targetInfo", {})
@@ -458,8 +511,105 @@ class CDPMonitor:
                     )
                     current_state = current_state.with_tab_update(target_id, new_tab)
             
+            # Handle Page events (navigation and loading states)
+            elif event.event_type in [
+                EventType.PAGE_FRAME_STARTED_NAVIGATING,
+                EventType.PAGE_FRAME_NAVIGATED,
+                EventType.PAGE_NAVIGATED_WITHIN_DOCUMENT,
+                EventType.PAGE_FRAME_STARTED_LOADING,
+                EventType.PAGE_FRAME_STOPPED_LOADING,
+                EventType.PAGE_DOM_CONTENT_EVENT_FIRED,
+                EventType.PAGE_LOAD_EVENT_FIRED
+            ]:
+                current_state = await self._handle_page_event(event, current_state)
+            
             # Atomic state update
             self._state = current_state
+    
+    async def _handle_page_event(self, event: CDPEvent, current_state: BrowserState) -> BrowserState:
+        """Handle Page events and update appropriate tab states"""
+        params = event.data
+        frame_id = params.get("frameId")
+        
+        # For navigation events, try to extract target info
+        if event.event_type == EventType.PAGE_FRAME_NAVIGATED:
+            frame_info = params.get("frame", {})
+            if frame_info.get("parentFrame") is None:  # This is a main frame
+                # This is a main frame navigation - update all tabs that might match
+                url = frame_info.get("url", "")
+                frame_id = frame_info.get("id")
+                
+                # For now, update the first tab that doesn't have a specific URL match
+                # This is a simplification - in reality we'd need better frame-to-target mapping
+                for target_id, tab_state in current_state.tabs.items():
+                    if abs(tab_state.timestamp - time.time()) < 10:  # Recently active tab
+                        updated_tab = tab_state.with_update(
+                            url=url,
+                            loading_state=LoadingState.COMPLETE,
+                            main_frame_id=frame_id
+                        )
+                        current_state = current_state.with_tab_update(target_id, updated_tab)
+                        if frame_id:
+                            self._frame_to_target[frame_id] = target_id
+                        break
+        
+        elif event.event_type == EventType.PAGE_FRAME_STARTED_NAVIGATING:
+            url = params.get("url", "")
+            if frame_id:
+                # Update tab if we have frame-to-target mapping
+                target_id = self._frame_to_target.get(frame_id)
+                if target_id and target_id in current_state.tabs:
+                    old_tab = current_state.tabs[target_id]
+                    updated_tab = old_tab.with_update(
+                        url=url,
+                        loading_state=LoadingState.LOADING
+                    )
+                    current_state = current_state.with_tab_update(target_id, updated_tab)
+        
+        elif event.event_type == EventType.PAGE_NAVIGATED_WITHIN_DOCUMENT:
+            url = params.get("url", "")
+            if frame_id:
+                target_id = self._frame_to_target.get(frame_id)
+                if target_id and target_id in current_state.tabs:
+                    old_tab = current_state.tabs[target_id]
+                    updated_tab = old_tab.with_update(
+                        url=url,
+                        loading_state=LoadingState.COMPLETE
+                    )
+                    current_state = current_state.with_tab_update(target_id, updated_tab)
+        
+        elif event.event_type == EventType.PAGE_FRAME_STARTED_LOADING:
+            if frame_id:
+                target_id = self._frame_to_target.get(frame_id)
+                if target_id and target_id in current_state.tabs:
+                    old_tab = current_state.tabs[target_id]
+                    updated_tab = old_tab.with_update(loading_state=LoadingState.LOADING)
+                    current_state = current_state.with_tab_update(target_id, updated_tab)
+        
+        elif event.event_type == EventType.PAGE_FRAME_STOPPED_LOADING:
+            if frame_id:
+                target_id = self._frame_to_target.get(frame_id)
+                if target_id and target_id in current_state.tabs:
+                    old_tab = current_state.tabs[target_id]
+                    updated_tab = old_tab.with_update(loading_state=LoadingState.COMPLETE)
+                    current_state = current_state.with_tab_update(target_id, updated_tab)
+        
+        elif event.event_type in [EventType.PAGE_DOM_CONTENT_EVENT_FIRED, EventType.PAGE_LOAD_EVENT_FIRED]:
+            # These events don't have frame IDs, they apply to the current context
+            # Update the most recently active tab
+            most_recent_target = None
+            most_recent_time = 0
+            for target_id, tab_state in current_state.tabs.items():
+                if tab_state.timestamp > most_recent_time:
+                    most_recent_time = tab_state.timestamp
+                    most_recent_target = target_id
+            
+            if most_recent_target:
+                old_tab = current_state.tabs[most_recent_target]
+                updated_tab = old_tab.with_update(loading_state=LoadingState.COMPLETE)
+                current_state = current_state.with_tab_update(most_recent_target, updated_tab)
+        
+        return current_state
     
     async def _mark_connection_unhealthy(self):
         """Mark connection as unhealthy"""
@@ -482,6 +632,7 @@ class CDPMonitor:
                     self._websocket = None
                 
                 await self._connect_websocket()
+                await self._populate_initial_state()
                 
                 # Mark connection as healthy
                 async with self._rw_lock.writer_lock:
