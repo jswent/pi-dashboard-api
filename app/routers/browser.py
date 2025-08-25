@@ -1,7 +1,7 @@
 import logging
 import time
 import base64
-from typing import Optional, List
+from typing import Optional, List, Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
 from fastapi.responses import StreamingResponse
 import io
@@ -16,15 +16,13 @@ from app.models.browser import (
 )
 from app.exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
 from app.services.playwright_browser_manager import BrowserManager
+from app.dependencies import get_browser_manager, managed_browser_operation
 
 router = APIRouter(tags=["browser"])
 log = logging.getLogger("app.router.browser")
 
-def get_browser(req: Request) -> BrowserManager:
-    """Dependency to get browser manager instance"""
-    if not hasattr(req.app.state, 'browser') or req.app.state.browser is None:
-        raise HTTPException(status_code=503, detail="Browser service not available")
-    return req.app.state.browser
+# Type alias for browser dependency
+BrowserDep = Annotated[BrowserManager, Depends(get_browser_manager)]
 
 # Custom exception handler
 class BrowserOperationError(Exception):
@@ -36,30 +34,24 @@ class BrowserOperationError(Exception):
 # ==================== BROWSER STATUS & MANAGEMENT ====================
 
 @router.get("/status", response_model=BrowserStatus)
-async def get_browser_status(browser: BrowserManager = Depends(get_browser)):
+async def get_browser_status(browser: BrowserDep):
     """Get current browser status including version and open tabs"""
-    try:
+    async with managed_browser_operation(browser, "get_status"):
         return await browser.status()
-    except Exception as e:
-        log.error("Failed to get browser status: %s", e)
-        raise HTTPException(status_code=502, detail="Failed to retrieve browser status")
 
 @router.get("/tabs", response_model=List[Tab])
-async def list_tabs(browser: BrowserManager = Depends(get_browser)):
+async def list_tabs(browser: BrowserDep):
     """List all open browser tabs"""
-    try:
+    async with managed_browser_operation(browser, "list_tabs"):
         return await browser.list_tabs()
-    except Exception as e:
-        log.error("Failed to list tabs: %s", e)
-        raise HTTPException(status_code=502, detail="Failed to list browser tabs")
 
 @router.post("/tabs", response_model=PageInfo)
 async def create_tab(
     request: CreatePageRequest,
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Create a new browser tab"""
-    try:
+    async with managed_browser_operation(browser, "create_tab"):
         if request.url:
             # Create tab with URL
             nav_request = NavigateRequest(
@@ -100,31 +92,20 @@ async def create_tab(
             url=tab.url,
             title=tab.title
         )
-        
-    except BrowserOperationError:
-        raise
-    except Exception as e:
-        log.error("Failed to create tab: %s", e)
-        raise HTTPException(status_code=502, detail=str(e))
 
 # ==================== NAVIGATION ====================
 
 @router.post("/goto", response_model=NavigateResult)
 async def navigate_to_url(
     body: NavigateRequest, 
-    browser: BrowserManager = Depends(get_browser)
+    browser: BrowserDep
 ):
     """Navigate to a URL in specified or current tab"""
-    try:
+    async with managed_browser_operation(browser, "navigate"):
         result = await browser.goto(body)
         if not result.ok:
             raise HTTPException(status_code=502, detail=result.error_text or "Navigation failed")
         return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error("Navigation failed: %s", e)
-        raise HTTPException(status_code=502, detail=str(e))
 
 @router.post("/{page}/reload", response_model=NavigateResult)
 async def reload_page(

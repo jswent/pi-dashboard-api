@@ -17,10 +17,19 @@ class BrowserManager:
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        
+        # Thread-safe state management
+        self._state_lock = asyncio.Lock()
         self._last_target_id: Optional[str] = None
         self._pages: Dict[str, Page] = {}  # target_id -> Page mapping
         self._browser_info: dict = {}
         self._page_counter = 0
+        
+        # Tab caching for performance
+        self._tabs_cache: Optional[List[Tab]] = None
+        self._tabs_cache_ts: float = 0
+        self._tabs_cache_ttl: float = 1.0  # 1 second TTL
+        self._tabs_cache_lock = asyncio.Lock()
         
     async def start(self):
         """Initialize browser connection using playwright"""
@@ -130,6 +139,12 @@ class BrowserManager:
             self.browser = None
             self.playwright = None
             log.info("BrowserManager stopped")
+    
+    async def _invalidate_tabs_cache(self):
+        """Helper method to invalidate the tabs cache"""
+        async with self._tabs_cache_lock:
+            self._tabs_cache = None
+            self._tabs_cache_ts = 0
             
     async def version(self) -> dict:
         """Get browser version information"""
@@ -179,9 +194,16 @@ class BrowserManager:
                     "User-Agent": self._browser_info.get("User-Agent", "")}
                     
     async def list_tabs(self) -> List[Tab]:
-        """List all open tabs/pages"""
+        """List all open tabs/pages with caching for performance"""
         if not self.browser or not self.browser.is_connected():
             return []
+            
+        # Check cache first
+        async with self._tabs_cache_lock:
+            now = time.time()
+            if (self._tabs_cache is not None and 
+                now - self._tabs_cache_ts < self._tabs_cache_ttl):
+                return self._tabs_cache.copy()  # Return copy to prevent mutation
             
         try:
             tabs = []
@@ -199,7 +221,7 @@ class BrowserManager:
                     # Generate a unique target ID for playwright pages
                     target_id = f"page_{id(page)}"
                     
-                    # Get page title safely
+                    # Get page title safely - this is expensive, so we cache it
                     try:
                         title = await page.title() if not page.is_closed() else "Closed Page"
                     except Exception:
@@ -214,6 +236,11 @@ class BrowserManager:
                         attached=not page.is_closed()
                     )
                     tabs.append(tab_info)
+            
+            # Update cache
+            async with self._tabs_cache_lock:
+                self._tabs_cache = tabs.copy()
+                self._tabs_cache_ts = time.time()
                     
             return tabs
         except Exception as e:
@@ -221,73 +248,75 @@ class BrowserManager:
             return []
             
     async def _resolve_page(self, page: Optional[str]) -> Tuple[Page, str]:
-        """Resolve page identifier to Page object and target_id"""
-        tabs = await self.list_tabs()
-        
-        if not tabs:
-            # Create a new page if none exist
-            context = await self._ensure_context()
-            new_page = await context.new_page()
-            target_id = f"page_{id(new_page)}"
-            self._pages[target_id] = new_page
-            self._last_target_id = target_id
-            return new_page, target_id
+        """Resolve page identifier to Page object and target_id - Thread safe"""
+        async with self._state_lock:
+            tabs = await self.list_tabs()
             
-        if page is None:
-            # Use last active or first page
-            if self._last_target_id and self._last_target_id in self._pages:
-                page_obj = self._pages[self._last_target_id]
-                if not page_obj.is_closed():
-                    return page_obj, self._last_target_id
+            if not tabs:
+                # Create a new page if none exist
+                context = await self._ensure_context()
+                new_page = await context.new_page()
+                target_id = f"page_{id(new_page)}"
+                self._pages[target_id] = new_page
+                self._last_target_id = target_id
+                await self._invalidate_tabs_cache()
+                return new_page, target_id
+                
+            if page is None:
+                # Use last active or first page
+                if self._last_target_id and self._last_target_id in self._pages:
+                    page_obj = self._pages[self._last_target_id]
+                    if not page_obj.is_closed():
+                        return page_obj, self._last_target_id
+                        
+                # Use first available page
+                if tabs:
+                    first_tab = tabs[0]
+                    target_id = first_tab.id
                     
-            # Use first available page
-            if tabs:
-                first_tab = tabs[0]
-                target_id = first_tab.id
+                    # Find the actual page object
+                    for context in self.browser.contexts:
+                        for pg in context.pages:
+                            if f"page_{id(pg)}" == target_id and not pg.is_closed():
+                                self._pages[target_id] = pg
+                                return pg, target_id
+                                
+            # Try to parse as integer index
+            try:
+                idx = int(page)
+                if 0 <= idx < len(tabs):
+                    target_tab = tabs[idx]
+                    target_id = target_tab.id
+                    
+                    # Find the actual page object
+                    for context in self.browser.contexts:
+                        for pg in context.pages:
+                            if f"page_{id(pg)}" == target_id and not pg.is_closed():
+                                self._pages[target_id] = pg
+                                return pg, target_id
+            except (ValueError, IndexError):
+                pass
                 
-                # Find the actual page object
-                for context in self.browser.contexts:
-                    for pg in context.pages:
-                        if f"page_{id(pg)}" == target_id and not pg.is_closed():
-                            self._pages[target_id] = pg
-                            return pg, target_id
-                            
-        # Try to parse as integer index
-        try:
-            idx = int(page)
-            if 0 <= idx < len(tabs):
-                target_tab = tabs[idx]
-                target_id = target_tab.id
-                
-                # Find the actual page object
-                for context in self.browser.contexts:
-                    for pg in context.pages:
-                        if f"page_{id(pg)}" == target_id and not pg.is_closed():
-                            self._pages[target_id] = pg
-                            return pg, target_id
-        except (ValueError, IndexError):
-            pass
-            
-        # Assume it's a target ID
-        if page in self._pages:
-            page_obj = self._pages[page]
-            if not page_obj.is_closed():
-                return page_obj, page
-                
-        # Search by target ID in tabs
-        for tab in tabs:
-            if tab.id == page:
-                # Find the actual page object
-                for context in self.browser.contexts:
-                    for pg in context.pages:
-                        if f"page_{id(pg)}" == tab.id and not pg.is_closed():
-                            self._pages[tab.id] = pg
-                            return pg, tab.id
-                            
-        raise ValueError(f"Page '{page}' not found")
+            # Assume it's a target ID
+            if page in self._pages:
+                page_obj = self._pages[page]
+                if not page_obj.is_closed():
+                    return page_obj, page
+                    
+            # Search by target ID in tabs
+            for tab in tabs:
+                if tab.id == page:
+                    # Find the actual page object
+                    for context in self.browser.contexts:
+                        for pg in context.pages:
+                            if f"page_{id(pg)}" == tab.id and not pg.is_closed():
+                                self._pages[tab.id] = pg
+                                return pg, tab.id
+                                
+            raise ValueError(f"Page '{page}' not found")
         
     async def _create_page(self, url: str) -> Tuple[Page, str]:
-        """Create a new page/tab"""
+        """Create a new page/tab - Thread safe"""
         try:
             context = await self._ensure_context()
             page = await context.new_page()
@@ -296,8 +325,10 @@ class BrowserManager:
             # Navigate to URL
             await page.goto(str(url), wait_until='load', timeout=30000)
             
-            self._pages[target_id] = page
-            self._last_target_id = target_id
+            async with self._state_lock:
+                self._pages[target_id] = page
+                self._last_target_id = target_id
+                await self._invalidate_tabs_cache()
             
             log.info("Created page %s -> %s", target_id, url)
             return page, target_id
@@ -368,7 +399,8 @@ class BrowserManager:
                 events = {self._get_event_key(body.wait): time.time()}
                 
             # Update last target
-            self._last_target_id = target_id
+            async with self._state_lock:
+                self._last_target_id = target_id
             
             # Get updated tab info
             tabs = await self.list_tabs()
@@ -460,29 +492,33 @@ class BrowserManager:
             page_obj, target_id = await self._resolve_page(page)
             await page_obj.bring_to_front()
             
+            async with self._state_lock:
+                self._last_target_id = target_id
+            
             tabs = await self.list_tabs()
-            self._last_target_id = target_id
             return next(t for t in tabs if t.id == target_id)
         except Exception as e:
             log.error("activate failed: %s", e)
             raise RuntimeError(f"Failed to activate page {page}: {e}")
             
     async def close(self, page: str):
-        """Close specified page"""
+        """Close specified page - Thread safe"""
         try:
             page_obj, target_id = await self._resolve_page(page)
             
             # Close the page
             await page_obj.close()
             
-            # Remove from tracking
-            if target_id in self._pages:
-                del self._pages[target_id]
-                
-            # Update last target if it was closed
-            if self._last_target_id == target_id:
-                tabs = await self.list_tabs()
-                self._last_target_id = tabs[0].id if tabs else None
+            async with self._state_lock:
+                # Remove from tracking
+                if target_id in self._pages:
+                    del self._pages[target_id]
+                    
+                # Update last target if it was closed
+                if self._last_target_id == target_id:
+                    self._last_target_id = None
+                    
+                await self._invalidate_tabs_cache()
                 
         except Exception as e:
             log.error("close failed: %s", e)

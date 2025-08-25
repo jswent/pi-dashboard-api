@@ -3,8 +3,7 @@ import logging
 from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.services.cec_manager import CecManager
-from app.services.playwright_browser_manager import BrowserManager
+from app.dependencies import cleanup_services, check_browser_health, check_cec_health
 from exceptions.browser import BrowserException, browser_exception_handler, general_exception_handler
 from app.routers import hdmi, browser
 
@@ -14,14 +13,14 @@ logging.getLogger("playwright").setLevel(logging.DEBUG)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.cec = CecManager(settings.CEC_DEVICE_NAME if hasattr(settings, "CEC_DEVICE_NAME") else "PiDash")
-    app.state.cec.start()
-    app.state.browser = BrowserManager(settings.BROWSER_DEBUG_HOST, settings.BROWSER_DEBUG_PORT)
-    await app.state.browser.start()
-    log.info("App services started")
+    """
+    Application lifespan manager with proper dependency injection.
+    Services are now initialized on-demand rather than at startup.
+    """
+    log.info("Application startup - services will initialize on demand")
     yield
-    await app.state.browser.stop()
-    app.state.cec.stop()
+    log.info("Application shutdown - cleaning up services")
+    await cleanup_services()
     log.info("App services stopped")
 
 app = FastAPI(
@@ -38,3 +37,21 @@ app.add_exception_handler(Exception, general_exception_handler)
 
 app.include_router(hdmi.router, prefix="/hdmi")
 app.include_router(browser.router, prefix="/browser")
+
+# Add health check endpoint
+@app.get("/health")
+async def health_check():
+    """Comprehensive health check for all services"""
+    browser_health = await check_browser_health()
+    cec_health = await check_cec_health()
+    
+    overall_status = "healthy" if (browser_health["status"] == "healthy" and cec_health["status"] == "healthy") else "unhealthy"
+    
+    return {
+        "status": overall_status,
+        "services": {
+            "browser": browser_health,
+            "cec": cec_health
+        },
+        "version": "0.2.0"
+    }

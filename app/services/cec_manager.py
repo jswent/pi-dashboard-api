@@ -117,7 +117,8 @@ class CecManager:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # power cache, last query, and inflight guard
+        # power cache, last query, and inflight guard - Thread safe
+        self._power_cache_lock = threading.RLock()  # Separate lock for power cache operations
         self._power_cache: Tuple[str, int] = ("unknown", 0)  # (state, ts_ms)
         self._power_q: "Queue[str]" = Queue(maxsize=16)
         self._last_power_query_ms: int = 0
@@ -162,7 +163,9 @@ class CecManager:
                 b = _param_byte(cmd, 0)
                 if b is not None:
                     state = _power_to_str(b)
-                    self._power_cache = (state, _now_ms())
+                    # Thread-safe power cache update
+                    with self._power_cache_lock:
+                        self._power_cache = (state, _now_ms())
                     try:
                         if self._power_q.full():
                             _ = self._power_q.get_nowait()
@@ -233,10 +236,13 @@ class CecManager:
 
             # Conditional keepalive: only if cache stale and we haven't queried too recently
             now = _now_ms()
-            state, ts = self._power_cache
-            stale = (now - ts) > int(settings.CEC_POWER_CACHE_MS)
-            recently_queried = (now - self._last_power_query_ms) < int(settings.CEC_MIN_QUERY_INTERVAL_MS)
-            if stale and not recently_queried and not self._power_inflight.is_set():
+            with self._power_cache_lock:
+                state, ts = self._power_cache
+                stale = (now - ts) > int(settings.CEC_POWER_CACHE_MS)
+                recently_queried = (now - self._last_power_query_ms) < int(settings.CEC_MIN_QUERY_INTERVAL_MS)
+                inflight = self._power_inflight.is_set()
+            
+            if stale and not recently_queried and not inflight:
                 try:
                     _ = self._query_power_once(wait_for_report=False)
                 except Exception:
@@ -253,8 +259,12 @@ class CecManager:
         """Issue one GIVE_DEVICE_POWER_STATUS (0x8F) and optionally wait for the 0x90 report."""
         if not self.is_connected():
             return "unknown"
-        self._power_inflight.set()
-        self._last_power_query_ms = _now_ms()
+        
+        # Thread-safe inflight tracking and query timestamp
+        with self._power_cache_lock:
+            self._power_inflight.set()
+            self._last_power_query_ms = _now_ms()
+        
         immediate = "unknown"
         try:
             code = self._adapter.GetDevicePowerStatus(libcec.CECDEVICE_TV)
@@ -267,7 +277,8 @@ class CecManager:
         if not wait_for_report:
             # do not wait — just return immediate snapshot
             if immediate != "unknown":
-                self._power_cache = (immediate, _now_ms())
+                with self._power_cache_lock:
+                    self._power_cache = (immediate, _now_ms())
             return immediate
 
         # drain old events, then wait briefly for the report
@@ -283,7 +294,8 @@ class CecManager:
             return newer
         except Empty:
             if immediate != "unknown":
-                self._power_cache = (immediate, _now_ms())
+                with self._power_cache_lock:
+                    self._power_cache = (immediate, _now_ms())
             return immediate
 
     def get_tv_power(self) -> str:
@@ -291,11 +303,13 @@ class CecManager:
         Return 'on'|'standby'|'transitioning'|'unknown'.
         Use cached REPORT_POWER_STATUS if fresh; otherwise request once,
         respecting a minimum re-query interval and deduplicating inflight calls.
+        Thread-safe implementation.
         """
-        # 1) Fresh cache?
-        state, ts = self._power_cache
-        if (_now_ms() - ts) <= int(settings.CEC_POWER_CACHE_MS):
-            return state
+        # 1) Fresh cache? - Thread-safe check
+        with self._power_cache_lock:
+            state, ts = self._power_cache
+            if (_now_ms() - ts) <= int(settings.CEC_POWER_CACHE_MS):
+                return state
 
         if not self.is_connected():
             return "unknown"
@@ -307,12 +321,16 @@ class CecManager:
                 newer = self._power_q.get(timeout=max(50, int(settings.CEC_WAIT_POWER_MS)) / 1000.0)
                 return newer
             except Empty:
+                with self._power_cache_lock:
+                    state, _ = self._power_cache
                 return state  # whatever we had
 
-        # 3) Rate-limit new queries
-        if (_now_ms() - self._last_power_query_ms) < int(settings.CEC_MIN_QUERY_INTERVAL_MS):
-            # Too soon: return last known state (no new bus traffic)
-            return state
+        # 3) Rate-limit new queries - Thread-safe check
+        with self._power_cache_lock:
+            if (_now_ms() - self._last_power_query_ms) < int(settings.CEC_MIN_QUERY_INTERVAL_MS):
+                # Too soon: return last known state (no new bus traffic)
+                state, _ = self._power_cache
+                return state
 
         # 4) Send one query and wait for the report (fast path ~10–30 ms on compliant TVs)
         return self._query_power_once(wait_for_report=True)
