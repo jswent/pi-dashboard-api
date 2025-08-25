@@ -357,41 +357,70 @@ class ChromeStateManager:
                 "method": "Target.getTargets",
                 "params": {}
             }
+            expected_id = self._next_request_id
             self._next_request_id += 1
+            
+            log.debug(f"Sending Target.getTargets request with id {expected_id}")
             
             async with self._websocket_lock:
                 await self._websocket.send(json.dumps(request))
                 
-                # Wait for response (this is initial setup, so blocking is OK)
-                response_raw = await asyncio.wait_for(self._websocket.recv(), timeout=5.0)
-                response = json.loads(response_raw)
-            
-            if response.get("id") == request["id"] and "result" in response:
-                targets = response["result"].get("targetInfos", [])
+                # We might receive multiple responses (Target.enable error + getTargets result)
+                # Keep reading until we get the response we need
+                max_attempts = 5
+                for attempt in range(max_attempts):
+                    try:
+                        response_raw = await asyncio.wait_for(self._websocket.recv(), timeout=2.0)
+                        response = json.loads(response_raw)
+                        
+                        log.debug(f"Received response (attempt {attempt + 1}): id={response.get('id')}, has_result={('result' in response)}, has_error={('error' in response)}")
+                        
+                        # Check if this is the Target.getTargets response we want
+                        if response.get("id") == expected_id:
+                            if "result" in response:
+                                targets = response["result"].get("targetInfos", [])
+                                log.debug(f"Found {len(targets)} targets in response")
+                                
+                                # Process each target
+                                new_tabs = {}
+                                for target in targets:
+                                    target_type = target.get("type")
+                                    log.debug(f"Processing target: type={target_type}, id={target.get('targetId')}, url={target.get('url', 'N/A')}")
+                                    
+                                    if target_type == "page":
+                                        tab_state = TabState(
+                                            target_id=target["targetId"],
+                                            url=target.get("url", ""),
+                                            title=target.get("title", "Unknown"),
+                                            loading_state=LoadingState.COMPLETE,
+                                            attached=target.get("attached", False)
+                                        )
+                                        new_tabs[target["targetId"]] = tab_state
+                                        log.debug(f"Added tab: {tab_state.title} ({tab_state.url})")
+                                
+                                # Atomic state update
+                                async with self._rw_lock.writer_lock:
+                                    self._stats["write_requests"] += 1
+                                    self._state = replace(self._state, tabs=new_tabs, last_update=time.time())
+                                
+                                log.info(f"Populated initial state with {len(new_tabs)} tabs")
+                                return  # Success!
+                            else:
+                                log.error(f"Target.getTargets returned error: {response.get('error')}")
+                                return
+                                
+                        # Not the response we're looking for, continue
+                        
+                    except asyncio.TimeoutError:
+                        log.warning(f"Timeout waiting for Target.getTargets response (attempt {attempt + 1})")
+                        break
                 
-                # Process each target
-                new_tabs = {}
-                for target in targets:
-                    if target.get("type") == "page":
-                        tab_state = TabState(
-                            target_id=target["targetId"],
-                            url=target.get("url", ""),
-                            title=target.get("title", "Unknown"),
-                            loading_state=LoadingState.COMPLETE,
-                            attached=target.get("attached", False)
-                        )
-                        new_tabs[target["targetId"]] = tab_state
-                
-                # Atomic state update
-                async with self._rw_lock.writer_lock:
-                    self._stats["write_requests"] += 1
-                    self._state = self._state.with_tab_update("", TabState("", "", "")).with_active_tab(None)
-                    self._state = replace(self._state, tabs=new_tabs, last_update=time.time())
-                
-                log.info(f"Populated initial state with {len(new_tabs)} tabs")
+                log.warning("Failed to get valid Target.getTargets response after all attempts")
         
         except Exception as e:
             log.error(f"Failed to populate initial state: {e}")
+            import traceback
+            log.debug(f"Stack trace: {traceback.format_exc()}")
             # Continue anyway - state will be updated via events
     
     async def _websocket_listener_worker(self):
